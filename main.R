@@ -4,6 +4,7 @@ library(lubridate)
 library(vroom)
 
 library(TTR)
+library(PerformanceAnalytics)
 
 library(xgboost)
 library(ranger)
@@ -17,8 +18,10 @@ ff  <- vroom("ff3f.CSV", col_types = cols(date = col_date(format = "%Y%m%d")))
 # Merge
 df <- left_join(mom, ff, by = "date")
 
+
 # Add yearmon
 df <- mutate(df, yearmon = paste(year(date), ifelse(nchar(month(date))==1, paste("0", month(date), sep = ""), month(date)), sep = ""))
+
 
 
 ndf <- df %>%
@@ -26,20 +29,21 @@ ndf <- df %>%
     pmom = tail(cumprod(c(1, (1 + (mom/100)))),(nrow(df))),
     pmkt = tail(cumprod(c(1, (1 + (`Mkt-RF`/100)))),(nrow(df))),
     psmb = tail(cumprod(c(1, (1 + (SMB/100)))),(nrow(df))),
-    phml = tail(cumprod(c(1, (1 + (HML/100)))),(nrow(df)))
+    phml = tail(cumprod(c(1, (1 + (HML/100)))),(nrow(df))),
+    
+    momlogret = log((1 + (mom/100)))
   ) %>%
   mutate( #sma
-    sma10mom = EMA(pmom, 10),
-    sma30mom = EMA(pmom, 30),
-    sma3mom = EMA(pmom, 3),
-    sma5mom = EMA(pmom, 5)
+    sma10mom = EMA(pmom, 5),
+    sma30mom = EMA(pmom, 40)
   ) %>%
   mutate( #diff sma
     dmom1030  = log(sma10mom) - log(sma30mom)
   ) %>%
   group_by(yearmon) %>%
-  summarise(m1030  = mean(dmom1030)) %>% ungroup %>% na.omit
-
+  summarise(m1030  = mean(dmom1030),
+            monret = exp(sum(momlogret))-1) %>%
+  ungroup %>% na.omit
 
 
 # Realized variances
@@ -52,19 +56,22 @@ rv <- df %>%
 
 rv <- left_join(rv, ndf, by = "yearmon")
 
-data <- rv %>%
+origdata <- rv %>%
   select(-yearmon) %>%
   mutate(y = lead(rvmom),
          lag1rvmom = lag(rvmom, 1),
          lag4rvmom = lag(rvmom, 4)
          
-         #log1 = log(rvmom),
-         #log2 = log(rvmkt)
+         #,log1 = log(rvmom),
+         #log2 = log(rvmkt),
+         #loglag1 = log(lag1rvmom),
+         #loglag2 = log(lag4rvmom)
          ) %>%
   na.omit
 
 
-data <- data %>% select(-rvsmb, -rvhml)
+data <- origdata %>% select(-rvsmb, -rvhml, -monret)
+
 
 
 # Train test split
@@ -72,10 +79,15 @@ idx <- floor(nrow(data)*.8)
 train <- data[1:idx,]
 test  <- data[(idx+1):nrow(data),]
 
+# Normalization
+ycol <- which(colnames(data) == "y")
+normParam <- preProcess(train[,-ycol], method = "range")
+train <- bind_cols(predict(normParam, train[,-ycol]), y = train$y)
+test  <- bind_cols(predict(normParam, test[,-ycol]), y = test$y)
+
 # LM on train data
 fit <- lm(y ~ ., data = train)
 summary(fit)
-
 
 
 
@@ -87,7 +99,9 @@ e <- (test$y - pred)
 lm(test$y ~ pred) %>% summary
 
 cat("MSE:", round(mean(e^2), 4)*100, "\n",
+    "MAE:", round(mean(abs(e)), 4), "\n",
     "Rsq:", round(cor(test[,1], pred)^2, 4), "\n")
+
 
 comp <- tibble(pred = pred, truth = test$y)
 plot(comp)
@@ -95,13 +109,98 @@ plot(comp)
 
 # CV
 # Define training control
-train.control <- trainControl(method = "LOOCV", verboseIter = T)
+#train.control <- trainControl(method = "LOOCV", verboseIter = T)
+train.control <- trainControl(method = "timeslice",
+                              initialWindow = 240,
+                              horizon = 1,
+                              fixedWindow = F,
+                              verboseIter = T)
 # Train the model
-model <- train(y ~ ., data = train, method = "lm",
-               trControl = train.control)
+model <- caret::train(y ~ ., data = data, method = "lm",
+                      trControl = train.control)
 # Summarize the results
 print(model)
 
+# ======================================================================================
+
+preds <- NULL
+start_mon <- 240
+
+for (i in (start_mon+1):nrow(data)) { #expanding window
+  
+  train <- data[1:(i-1),]
+  test <- data[i,]
+  fit <- lm(y ~ rvmom, data = train)
+  pred <- predict(fit, test) %>% unname
+  
+  preds <- c(preds, pred)
+  
+}
+
+preds <- c(rep(NA, start_mon), preds)
+
+target_vol <- 0.58
+weights <- target_vol / preds
+
+res <- tibble(pred = preds,
+              weight = weights)
+
+res <- bind_cols(origdata, res) %>% select(monret, y, pred, weight) %>% na.omit
+
+# Scaled returns
+res <- mutate(res, scaledmonret = monret * weight)
+
+# Normalizing
+# normweightparam <- preProcess(as.data.frame(res$weight), method = "range")
+# normweight <- predict(normweightparam, as.data.frame(res$weight))[,1]
+# res <- bind_cols(res, normweight = normweight)
+# res <- mutate(res, scaledmonret = monret * normweight)
+
+# RET2PRICE Momentum
+prc <- cumprod(c(1, (1 + (res$monret[500:875]))))
+plot(prc, type = "l")
+
+prc <- cumprod(c(1, (1 + (res$scaledmonret[500:875]))))
+plot(prc, type = "l")
+
+msharpe <- function(x) {(mean(x) * 12) / (sd(x) * sqrt(12))}
+
+cat("Regular momentum:", round(msharpe(res$monret), 2))
+cat("Scaled momentum:", round(msharpe(res$scaledmonret), 2))
+
+
+
+
+
+
+
+ggplot(res) +
+  geom_line(aes(x = seq_along(y), y = monret)) +
+  #geom_line(aes(x = seq_along(y), y = pred), col = "red") +
+  geom_line(aes(x = seq_along(y), y = weight), col = "red") +
+  theme_bw()
+
+
+
+
+
+momdf <- tail(momdf, 1115)
+weights <- c(rep(NA, 240), weights)
+withw <- bind_cols(momdf, volw = weights) %>% na.omit
+withw <- mutate(withw, scaled = monret * volw)
+
+prc <- cumprod(c(100, (1 + (withw$scaled/100)) ))
+plot(prc, type = "l")
+
+
+# SHARPE
+mean(withw$scaled) / sd(withw$scaled)
+sd(withw$scaled)
+
+(mean(withw$scaled)*12) / (sd(withw$scaled)*sqrt(12))
+
+SharpeRatio.annualized(withw$scaled, scale = 12)
+SharpeRatio(withw$scaled)
 
 
 
@@ -177,6 +276,7 @@ momstrat <- cumprod(c(100, (1 + (df$mom[1:24582]/100)) ))
 plot(momstrat, type = "l")
 
 
+
 #################################################
 
 # KERAS
@@ -184,9 +284,9 @@ plot(momstrat, type = "l")
 library(keras)
 library(tensorflow)
 
-normParam <- preProcess(train, method = "range")
-train <- predict(normParam, train)
-test  <- predict(normParam, test)
+normParam <- preProcess(train[,-ycol], method = "range")
+train <- bind_cols(predict(normParam, train[,-ycol]), y = train$y)
+test  <- bind_cols(predict(normParam, test[,-ycol]), y = test$y)
 
 xtrain <- train %>% select(-y) %>% as.matrix
 ytrain <- train %>% select(y) %>% as.matrix
@@ -196,8 +296,8 @@ model <- keras_model_sequential()
 
 model %>%
   layer_dense(units = 5, input_shape = c(5)) %>%
-  layer_dense(units = 5, activation = "relu") %>%
-  layer_dense(units = 5, activation = "relu") %>%
+  layer_dense(units = 20, activation = "relu") %>%
+  layer_dense(units = 20, activation = "relu") %>%
   layer_dense(units = 1, activation = "relu")
 
 
@@ -213,7 +313,7 @@ model %>% compile(
 
 history <- model %>% fit(
   xtrain, ytrain, 
-  epochs = 50, batch_size = 64, 
+  epochs = 100, batch_size = 64, 
   validation_split = 0.2
 )
 
@@ -225,5 +325,10 @@ cat("MSE:", round(mean(e^2), 4)*100, "\n",
     "Rsq:", round(cor(test[,1], pred)^2, 4), "\n")
 comp <- tibble(pred = pred, truth = test$y)
 plot(comp)
+
+
+
+
+
 
 
