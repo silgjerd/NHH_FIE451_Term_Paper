@@ -72,7 +72,7 @@ origdata <- rv %>%
 
 data <- origdata %>% select(-rvsmb, -rvhml, -monret)
 
-
+##########################################################################################
 
 # Train test split
 idx <- floor(nrow(data)*.8)
@@ -130,7 +130,8 @@ for (i in (start_mon+1):nrow(data)) { #expanding window
   
   train <- data[1:(i-1),]
   test <- data[i,]
-  fit <- lm(y ~ rvmom, data = train)
+  
+  fit <- lm(y ~ rvmom + lag4rvmom, data = train)
   pred <- predict(fit, test) %>% unname
   
   preds <- c(preds, pred)
@@ -151,17 +152,11 @@ res <- bind_cols(origdata, res) %>% select(monret, y, pred, weight) %>% na.omit
 res <- mutate(res, scaledmonret = monret * weight)
 
 # Normalizing
-# normweightparam <- preProcess(as.data.frame(res$weight), method = "range")
-# normweight <- predict(normweightparam, as.data.frame(res$weight))[,1]
-# res <- bind_cols(res, normweight = normweight)
-# res <- mutate(res, scaledmonret = monret * normweight)
+normweightparam <- preProcess(as.data.frame(res$weight), method = "range")
+normweight <- predict(normweightparam, as.data.frame(res$weight))[,1]
+res <- bind_cols(res, normweight = normweight)
+res <- mutate(res, scaledmonret = monret * normweight)
 
-# RET2PRICE Momentum
-prc <- cumprod(c(1, (1 + (res$monret[500:875]))))
-plot(prc, type = "l")
-
-prc <- cumprod(c(1, (1 + (res$scaledmonret[500:875]))))
-plot(prc, type = "l")
 
 msharpe <- function(x) {(mean(x) * 12) / (sd(x) * sqrt(12))}
 
@@ -171,6 +166,17 @@ cat("Scaled momentum:", round(msharpe(res$scaledmonret), 2))
 
 
 
+# PLOT
+# RET2PRICE Momentum
+pricereg <- cumprod(c(1, (1 + (res$monret[500:875]))))
+pricescl <- cumprod(c(1, (1 + (res$scaledmonret[500:875]))))
+prices <- tibble(pricereg = pricereg, pricescl = pricescl)
+
+prices %>%
+  ggplot(aes(x = seq_along(pricereg))) +
+  geom_line(aes(y = pricereg)) +
+  geom_line(aes(y = pricescl), col = "red") +
+  theme_bw()
 
 
 
